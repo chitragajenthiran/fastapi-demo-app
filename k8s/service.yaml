@@ -1,0 +1,19 @@
+# Kubernetes Service for FastAPI Demo App
+# This exposes your pods to network traffic
+apiVersion: v1
+kind: Service
+metadata:
+  name: fastapi-demo-service
+  labels:
+    app: fastapi-demo
+spec:
+  type: NodePort  # Exposes service on each node's IP at a static port
+  # Use LoadBalancer type if running on AWS EKS:
+  # type: LoadBalancer
+  selector:
+    app: fastapi-demo
+  ports:
+    - protocol: TCP
+      port: 80        # Service port (external)
+      targetPort: 8000 # Container port (internal)
+      nodePort: 30080  # Port on the node (30000-32767 range)

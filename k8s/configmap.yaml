@@ -1,0 +1,12 @@
+# Kubernetes ConfigMap
+# Store non-sensitive configuration data
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fastapi-config
+  labels:
+    app: fastapi-demo
+data:
+  APP_NAME: "FastAPI Demo App"
+  LOG_LEVEL: "INFO"
+  ENVIRONMENT: "production"

@@ -1,0 +1,196 @@
+# =============================================================================
+# Azure DevOps CI/CD Pipeline for FastAPI App Deployment to AWS EC2
+# =============================================================================
+# This pipeline builds a Docker image and deploys it to an AWS EC2 instance
+# 
+# PREREQUISITES:
+# 1. Create an Azure DevOps project
+# 2. Set up a Service Connection for SSH to EC2
+# 3. Configure Pipeline Variables (see section below)
+# =============================================================================
+
+trigger:
+  branches:
+    include:
+      - main
+      - master
+  paths:
+    exclude:
+      - README.md
+      - docs/*
+
+# Variables - Configure these in Azure DevOps Pipeline Variables (Settings)
+# Mark sensitive values as "secret"
+variables:
+  # Docker settings
+  dockerImageName: 'fastapi-demo-app'
+  dockerTag: '$(Build.BuildId)'
+  
+  # EC2 settings (set these as Pipeline Variables in Azure DevOps)
+  # EC2_HOST: Your EC2 public IP or DNS
+  # EC2_USER: ec2-user (Amazon Linux) or ubuntu (Ubuntu)
+  # SSH_SERVICE_CONNECTION: Name of your SSH service connection
+
+stages:
+  # =============================================================================
+  # STAGE 1: BUILD
+  # =============================================================================
+  - stage: Build
+    displayName: 'Build & Test'
+    jobs:
+      - job: BuildJob
+        displayName: 'Build Docker Image'
+        pool:
+          vmImage: 'ubuntu-latest'
+        
+        steps:
+          # Checkout code
+          - checkout: self
+            displayName: 'Checkout Repository'
+
+          # Install Python for testing
+          - task: UsePythonVersion@0
+            displayName: 'Use Python 3.11'
+            inputs:
+              versionSpec: '3.11'
+
+          # Install dependencies and run tests
+          - script: |
+              python -m pip install --upgrade pip
+              pip install -r requirements.txt
+              pip install pytest httpx
+            displayName: 'Install Dependencies'
+
+          - script: |
+              # Run simple health check test
+              python -c "from app.main import app; print('✓ App imports successfully')"
+            displayName: 'Validate App'
+
+          # Build Docker image
+          - task: Docker@2
+            displayName: 'Build Docker Image'
+            inputs:
+              command: 'build'
+              Dockerfile: 'Dockerfile'
+              tags: |
+                $(dockerImageName):$(dockerTag)
+                $(dockerImageName):latest
+
+          # Save Docker image as artifact
+          - script: |
+              docker save $(dockerImageName):$(dockerTag) -o $(Build.ArtifactStagingDirectory)/docker-image.tar
+            displayName: 'Save Docker Image'
+
+          # Publish Docker image artifact
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish Docker Image Artifact'
+            inputs:
+              PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+              ArtifactName: 'docker-image'
+              publishLocation: 'Container'
+
+          # Publish deployment scripts
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish Deployment Scripts'
+            inputs:
+              PathtoPublish: '$(System.DefaultWorkingDirectory)'
+              ArtifactName: 'deploy-scripts'
+              publishLocation: 'Container'
+
+  # =============================================================================
+  # STAGE 2: DEPLOY TO EC2
+  # =============================================================================
+  - stage: Deploy
+    displayName: 'Deploy to EC2'
+    dependsOn: Build
+    condition: succeeded()
+    jobs:
+      - deployment: DeployToEC2
+        displayName: 'Deploy to AWS EC2'
+        pool:
+          vmImage: 'ubuntu-latest'
+        environment: 'production'  # Create this environment in Azure DevOps
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                # Download artifacts
+                - download: current
+                  artifact: docker-image
+                  displayName: 'Download Docker Image'
+
+                - download: current
+                  artifact: deploy-scripts
+                  displayName: 'Download Deploy Scripts'
+
+                # Deploy to EC2 via SSH
+                # Option 1: Using SSH Service Connection
+                - task: SSH@0
+                  displayName: 'Deploy to EC2'
+                  inputs:
+                    sshEndpoint: '$(SSH_SERVICE_CONNECTION)'
+                    runOptions: 'inline'
+                    inline: |
+                      echo "=== Stopping existing containers ==="
+                      docker stop fastapi-demo-app || true
+                      docker rm fastapi-demo-app || true
+                      
+                      echo "=== Cleaning up old images ==="
+                      docker image prune -f
+                      
+                      echo "=== Loading new Docker image ==="
+                      docker load -i /tmp/docker-image.tar
+                      
+                      echo "=== Starting new container ==="
+                      docker run -d \
+                        --name fastapi-demo-app \
+                        --restart unless-stopped \
+                        -p 8000:8000 \
+                        -e ENVIRONMENT=production \
+                        $(dockerImageName):$(dockerTag)
+                      
+                      echo "=== Verifying deployment ==="
+                      sleep 5
+                      curl -f http://localhost:8000/health || exit 1
+                      
+                      echo "=== Deployment successful! ==="
+                    readyTimeout: '20000'
+
+                # Copy Docker image to EC2 first
+                - task: CopyFilesOverSSH@0
+                  displayName: 'Copy Docker Image to EC2'
+                  inputs:
+                    sshEndpoint: '$(SSH_SERVICE_CONNECTION)'
+                    sourceFolder: '$(Pipeline.Workspace)/docker-image'
+                    contents: 'docker-image.tar'
+                    targetFolder: '/tmp'
+                    cleanTargetFolder: false
+
+  # =============================================================================
+  # STAGE 3: VERIFY DEPLOYMENT
+  # =============================================================================
+  - stage: Verify
+    displayName: 'Verify Deployment'
+    dependsOn: Deploy
+    condition: succeeded()
+    jobs:
+      - job: HealthCheck
+        displayName: 'Health Check'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - script: |
+              echo "Waiting for application to stabilize..."
+              sleep 10
+              
+              echo "Checking health endpoint..."
+              response=$(curl -s -o /dev/null -w "%{http_code}" http://$(EC2_HOST):8000/health)
+              
+              if [ "$response" = "200" ]; then
+                echo "✓ Health check passed! Application is running."
+                curl -s http://$(EC2_HOST):8000/api/info | python -m json.tool
+              else
+                echo "✗ Health check failed with status: $response"
+                exit 1
+              fi
+            displayName: 'Verify Application Health'

@@ -1,0 +1,9 @@
+# Kubernetes Namespace
+# Namespaces help organize resources and provide isolation
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: fastapi-app
+  labels:
+    name: fastapi-app
+    environment: development

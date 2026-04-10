@@ -1,0 +1,55 @@
+# Kubernetes Deployment for FastAPI Demo App
+# This creates pods running your application
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fastapi-demo-app
+  labels:
+    app: fastapi-demo
+spec:
+  replicas: 2  # Number of pod replicas for high availability
+  selector:
+    matchLabels:
+      app: fastapi-demo
+  template:
+    metadata:
+      labels:
+        app: fastapi-demo
+    spec:
+      containers:
+        - name: fastapi-demo
+          image: fastapi-demo-app:latest  # Will be replaced by CI/CD pipeline
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+              protocol: TCP
+          # Resource limits and requests
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
+          # Liveness probe - restarts container if unhealthy
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          # Readiness probe - removes from service if not ready
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # Environment variables
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"

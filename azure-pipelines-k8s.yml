@@ -1,0 +1,163 @@
+# =============================================================================
+# Azure DevOps CI/CD Pipeline - Kubernetes Deployment to EC2 (Minikube)
+# =============================================================================
+# This pipeline deploys to a single EC2 instance running Minikube (for learning)
+# For production, consider using AWS EKS instead
+# =============================================================================
+
+trigger:
+  branches:
+    include:
+      - main
+      - master
+
+variables:
+  dockerImageName: 'fastapi-demo-app'
+  dockerTag: '$(Build.BuildId)'
+  kubernetesNamespace: 'fastapi-app'
+
+stages:
+  # =============================================================================
+  # STAGE 1: BUILD
+  # =============================================================================
+  - stage: Build
+    displayName: 'Build & Package'
+    jobs:
+      - job: BuildJob
+        displayName: 'Build Docker Image'
+        pool:
+          vmImage: 'ubuntu-latest'
+        
+        steps:
+          - checkout: self
+
+          - task: Docker@2
+            displayName: 'Build Docker Image'
+            inputs:
+              command: 'build'
+              Dockerfile: 'Dockerfile'
+              tags: |
+                $(dockerImageName):$(dockerTag)
+                $(dockerImageName):latest
+
+          - script: |
+              docker save $(dockerImageName):$(dockerTag) -o $(Build.ArtifactStagingDirectory)/docker-image.tar
+            displayName: 'Save Docker Image'
+
+          - task: PublishBuildArtifacts@1
+            inputs:
+              PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+              ArtifactName: 'docker-image'
+
+          - task: PublishBuildArtifacts@1
+            inputs:
+              PathtoPublish: '$(System.DefaultWorkingDirectory)/k8s'
+              ArtifactName: 'k8s-manifests'
+
+  # =============================================================================
+  # STAGE 2: DEPLOY TO KUBERNETES (Minikube on EC2)
+  # =============================================================================
+  - stage: DeployK8s
+    displayName: 'Deploy to Kubernetes'
+    dependsOn: Build
+    jobs:
+      - deployment: DeployToMinikube
+        displayName: 'Deploy to Minikube on EC2'
+        pool:
+          vmImage: 'ubuntu-latest'
+        environment: 'production-k8s'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: current
+                  artifact: docker-image
+
+                - download: current
+                  artifact: k8s-manifests
+
+                # Copy files to EC2
+                - task: CopyFilesOverSSH@0
+                  displayName: 'Copy Docker Image to EC2'
+                  inputs:
+                    sshEndpoint: '$(SSH_SERVICE_CONNECTION)'
+                    sourceFolder: '$(Pipeline.Workspace)/docker-image'
+                    contents: '**'
+                    targetFolder: '/tmp/deploy'
+
+                - task: CopyFilesOverSSH@0
+                  displayName: 'Copy K8s Manifests to EC2'
+                  inputs:
+                    sshEndpoint: '$(SSH_SERVICE_CONNECTION)'
+                    sourceFolder: '$(Pipeline.Workspace)/k8s-manifests'
+                    contents: '**'
+                    targetFolder: '/tmp/deploy/k8s'
+
+                # Deploy to Minikube
+                - task: SSH@0
+                  displayName: 'Deploy to Minikube'
+                  inputs:
+                    sshEndpoint: '$(SSH_SERVICE_CONNECTION)'
+                    runOptions: 'inline'
+                    inline: |
+                      cd /tmp/deploy
+                      
+                      echo "=== Configuring Minikube Docker environment ==="
+                      eval $(minikube docker-env)
+                      
+                      echo "=== Loading Docker image ==="
+                      docker load -i docker-image.tar
+                      docker tag $(dockerImageName):$(dockerTag) $(dockerImageName):latest
+                      
+                      echo "=== Updating Kubernetes deployment ==="
+                      # Update the image tag in deployment
+                      sed -i 's|image: fastapi-demo-app:.*|image: $(dockerImageName):$(dockerTag)|g' k8s/deployment.yaml
+                      
+                      echo "=== Applying Kubernetes manifests ==="
+                      kubectl apply -f k8s/namespace.yaml
+                      kubectl apply -f k8s/configmap.yaml
+                      kubectl apply -f k8s/deployment.yaml -n $(kubernetesNamespace)
+                      kubectl apply -f k8s/service.yaml -n $(kubernetesNamespace)
+                      
+                      echo "=== Waiting for rollout ==="
+                      kubectl rollout status deployment/fastapi-demo-app -n $(kubernetesNamespace) --timeout=120s
+                      
+                      echo "=== Deployment Status ==="
+                      kubectl get pods -n $(kubernetesNamespace)
+                      kubectl get services -n $(kubernetesNamespace)
+                      
+                      echo "=== Getting Service URL ==="
+                      minikube service fastapi-demo-service -n $(kubernetesNamespace) --url
+                      
+                      echo "=== Deployment successful! ==="
+                    readyTimeout: '30000'
+
+  # =============================================================================
+  # STAGE 3: VERIFY
+  # =============================================================================
+  - stage: Verify
+    displayName: 'Verify Kubernetes Deployment'
+    dependsOn: DeployK8s
+    jobs:
+      - job: K8sHealthCheck
+        displayName: 'Kubernetes Health Check'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - task: SSH@0
+            displayName: 'Check Pod Health'
+            inputs:
+              sshEndpoint: '$(SSH_SERVICE_CONNECTION)'
+              runOptions: 'inline'
+              inline: |
+                echo "=== Checking Pod Status ==="
+                kubectl get pods -n $(kubernetesNamespace) -o wide
+                
+                echo "=== Checking Pod Logs ==="
+                kubectl logs -l app=fastapi-demo --tail=20 -n $(kubernetesNamespace)
+                
+                echo "=== Testing Health Endpoint ==="
+                POD_NAME=$(kubectl get pods -n $(kubernetesNamespace) -l app=fastapi-demo -o jsonpath='{.items[0].metadata.name}')
+                kubectl exec $POD_NAME -n $(kubernetesNamespace) -- curl -s http://localhost:8000/health
+                
+                echo "=== All checks passed! ==="
