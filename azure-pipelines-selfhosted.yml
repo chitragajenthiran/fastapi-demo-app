@@ -1,11 +1,13 @@
 # =============================================================================
-# Azure DevOps CI/CD Pipeline - Self-Hosted Agent on EC2
+# Azure DevOps CI/CD Pipeline - Self-Hosted Agent on EC2 with ECR
 # =============================================================================
 # This pipeline uses your EC2 instance as the build agent (FREE - no parallelism needed!)
+# Builds image on EC2, pushes to AWS ECR, then runs container from ECR
 # 
 # SETUP REQUIRED:
 # 1. Install Azure DevOps agent on EC2 (one-time setup - see README)
 # 2. Create agent pool named 'EC2-Pool' in Azure DevOps
+# 3. Create Variable Group 'EC2-Deployment-Vars' with AWS credentials
 # =============================================================================
 
 trigger:
@@ -19,19 +21,21 @@ trigger:
       - docs/*
 
 variables:
-  dockerImageName: 'fastapi-demo-app'
-  dockerTag: '$(Build.BuildId)'
-  group: EC2-Deployment-Vars
+  - group: EC2-Deployment-Vars  # Contains: AWS_ACCOUNT_ID, AWS_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+  - name: dockerImageName
+    value: 'fastapi-demo-app'
+  - name: dockerTag
+    value: '$(Build.BuildId)'
 
 stages:
   # =============================================================================
-  # SINGLE STAGE: BUILD & DEPLOY (runs directly on EC2)
+  # STAGE 1: BUILD & PUSH TO ECR (runs on EC2 self-hosted agent)
   # =============================================================================
-  - stage: BuildAndDeploy
-    displayName: 'Build & Deploy on EC2'
+  - stage: BuildAndPush
+    displayName: 'Build & Push to ECR'
     jobs:
-      - job: BuildDeployJob
-        displayName: 'Build and Deploy'
+      - job: BuildPushJob
+        displayName: 'Build and Push to ECR'
         pool:
           name: 'EC2-Pool'  # Your self-hosted agent pool
         
@@ -51,14 +55,99 @@ stages:
                 sudo systemctl enable docker
                 sudo usermod -aG docker $USER
               fi
+              sudo systemctl start docker
               sudo docker --version
             displayName: 'Ensure Docker is installed'
+
+          # Ensure AWS CLI is installed
+          - script: |
+              echo "=== Checking AWS CLI ==="
+              if ! command -v aws &> /dev/null; then
+                echo "Installing AWS CLI..."
+                curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+                unzip -q awscliv2.zip
+                sudo ./aws/install
+                rm -rf aws awscliv2.zip
+              fi
+              aws --version
+            displayName: 'Ensure AWS CLI is installed'
+
+          # Configure AWS credentials
+          - script: |
+              echo "=== Configuring AWS Credentials ==="
+              aws configure set aws_access_key_id $(AWS_ACCESS_KEY_ID)
+              aws configure set aws_secret_access_key $(AWS_SECRET_ACCESS_KEY)
+              aws configure set default.region $(AWS_REGION)
+            displayName: 'Configure AWS Credentials'
+            env:
+              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+
+          # Login to ECR
+          - script: |
+              echo "=== Logging into AWS ECR ==="
+              aws ecr get-login-password --region $(AWS_REGION) | sudo docker login --username AWS --password-stdin $(AWS_ACCOUNT_ID).dkr.ecr.$(AWS_REGION).amazonaws.com
+            displayName: 'Login to AWS ECR'
+
+          # Create ECR repository if it doesn't exist
+          - script: |
+              echo "=== Creating ECR repository (if not exists) ==="
+              aws ecr describe-repositories --repository-names $(dockerImageName) --region $(AWS_REGION) 2>/dev/null || \
+              aws ecr create-repository --repository-name $(dockerImageName) --region $(AWS_REGION)
+            displayName: 'Create ECR Repository'
 
           # Build Docker image
           - script: |
               echo "=== Building Docker Image ==="
               sudo docker build -t $(dockerImageName):$(dockerTag) -t $(dockerImageName):latest .
             displayName: 'Build Docker Image'
+
+          # Tag for ECR
+          - script: |
+              echo "=== Tagging for ECR ==="
+              ECR_REPO=$(AWS_ACCOUNT_ID).dkr.ecr.$(AWS_REGION).amazonaws.com/$(dockerImageName)
+              sudo docker tag $(dockerImageName):$(dockerTag) $ECR_REPO:$(dockerTag)
+              sudo docker tag $(dockerImageName):latest $ECR_REPO:latest
+              echo "Tagged: $ECR_REPO:$(dockerTag)"
+              echo "Tagged: $ECR_REPO:latest"
+            displayName: 'Tag Image for ECR'
+
+          # Push to ECR
+          - script: |
+              echo "=== Pushing to ECR ==="
+              ECR_REPO=$(AWS_ACCOUNT_ID).dkr.ecr.$(AWS_REGION).amazonaws.com/$(dockerImageName)
+              sudo docker push $ECR_REPO:$(dockerTag)
+              sudo docker push $ECR_REPO:latest
+              echo "✓ Pushed: $ECR_REPO:$(dockerTag)"
+              echo "✓ Pushed: $ECR_REPO:latest"
+            displayName: 'Push to ECR'
+
+  # =============================================================================
+  # STAGE 2: DEPLOY FROM ECR (runs on same EC2)
+  # =============================================================================
+  - stage: Deploy
+    displayName: 'Deploy from ECR'
+    dependsOn: BuildAndPush
+    condition: succeeded()
+    jobs:
+      - job: DeployJob
+        displayName: 'Pull and Deploy'
+        pool:
+          name: 'EC2-Pool'
+        
+        steps:
+          # Login to ECR
+          - script: |
+              echo "=== Logging into AWS ECR ==="
+              aws ecr get-login-password --region $(AWS_REGION) | sudo docker login --username AWS --password-stdin $(AWS_ACCOUNT_ID).dkr.ecr.$(AWS_REGION).amazonaws.com
+            displayName: 'Login to ECR'
+
+          # Pull latest image from ECR
+          - script: |
+              echo "=== Pulling Image from ECR ==="
+              ECR_REPO=$(AWS_ACCOUNT_ID).dkr.ecr.$(AWS_REGION).amazonaws.com/$(dockerImageName)
+              sudo docker pull $ECR_REPO:$(dockerTag)
+            displayName: 'Pull Image from ECR'
 
           # Deploy container
           - script: |
@@ -69,13 +158,14 @@ stages:
               echo "=== Cleaning up old images ==="
               sudo docker image prune -f
               
-              echo "=== Starting new container ==="
+              echo "=== Starting new container from ECR ==="
+              ECR_REPO=$(AWS_ACCOUNT_ID).dkr.ecr.$(AWS_REGION).amazonaws.com/$(dockerImageName)
               sudo docker run -d \
                 --name $(dockerImageName) \
                 --restart unless-stopped \
                 -p 8000:8000 \
                 -e ENVIRONMENT=production \
-                $(dockerImageName):$(dockerTag)
+                $ECR_REPO:$(dockerTag)
               
               echo "=== Waiting for startup ==="
               sleep 5
@@ -84,7 +174,7 @@ stages:
               curl -f http://localhost:8000/health || exit 1
               
               echo "=== Deployment successful! ==="
-            displayName: 'Deploy Container'
+            displayName: 'Deploy Container from ECR'
 
           # Show status
           - script: |
@@ -93,6 +183,9 @@ stages:
               echo ""
               echo "=== Application Info ==="
               curl -s http://localhost:8000/api/info | python3 -m json.tool || true
+              echo ""
+              echo "=== ECR Image Info ==="
+              echo "Image: $(AWS_ACCOUNT_ID).dkr.ecr.$(AWS_REGION).amazonaws.com/$(dockerImageName):$(dockerTag)"
               echo ""
               echo "✅ App is running at: http://$(curl -s ifconfig.me):8000"
             displayName: 'Show Deployment Status'
