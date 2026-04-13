@@ -1,0 +1,98 @@
+# =============================================================================
+# Azure DevOps CI/CD Pipeline - Self-Hosted Agent on EC2
+# =============================================================================
+# This pipeline uses your EC2 instance as the build agent (FREE - no parallelism needed!)
+# 
+# SETUP REQUIRED:
+# 1. Install Azure DevOps agent on EC2 (one-time setup - see README)
+# 2. Create agent pool named 'EC2-Pool' in Azure DevOps
+# =============================================================================
+
+trigger:
+  branches:
+    include:
+      - main
+      - master
+  paths:
+    exclude:
+      - README.md
+      - docs/*
+
+variables:
+  dockerImageName: 'fastapi-demo-app'
+  dockerTag: '$(Build.BuildId)'
+  group: EC2-Deployment-Vars
+
+stages:
+  # =============================================================================
+  # SINGLE STAGE: BUILD & DEPLOY (runs directly on EC2)
+  # =============================================================================
+  - stage: BuildAndDeploy
+    displayName: 'Build & Deploy on EC2'
+    jobs:
+      - job: BuildDeployJob
+        displayName: 'Build and Deploy'
+        pool:
+          name: 'EC2-Pool'  # Your self-hosted agent pool
+        
+        steps:
+          # Checkout code
+          - checkout: self
+            displayName: 'Checkout Repository'
+
+          # Ensure Docker is installed
+          - script: |
+              echo "=== Checking Docker ==="
+              if ! command -v docker &> /dev/null; then
+                echo "Installing Docker..."
+                sudo dnf update -y || sudo apt update
+                sudo dnf install docker -y || sudo apt install -y docker.io
+                sudo systemctl start docker
+                sudo systemctl enable docker
+                sudo usermod -aG docker $USER
+              fi
+              sudo docker --version
+            displayName: 'Ensure Docker is installed'
+
+          # Build Docker image
+          - script: |
+              echo "=== Building Docker Image ==="
+              sudo docker build -t $(dockerImageName):$(dockerTag) -t $(dockerImageName):latest .
+            displayName: 'Build Docker Image'
+
+          # Deploy container
+          - script: |
+              echo "=== Stopping existing container ==="
+              sudo docker stop $(dockerImageName) || true
+              sudo docker rm $(dockerImageName) || true
+              
+              echo "=== Cleaning up old images ==="
+              sudo docker image prune -f
+              
+              echo "=== Starting new container ==="
+              sudo docker run -d \
+                --name $(dockerImageName) \
+                --restart unless-stopped \
+                -p 8000:8000 \
+                -e ENVIRONMENT=production \
+                $(dockerImageName):$(dockerTag)
+              
+              echo "=== Waiting for startup ==="
+              sleep 5
+              
+              echo "=== Verifying deployment ==="
+              curl -f http://localhost:8000/health || exit 1
+              
+              echo "=== Deployment successful! ==="
+            displayName: 'Deploy Container'
+
+          # Show status
+          - script: |
+              echo "=== Container Status ==="
+              sudo docker ps
+              echo ""
+              echo "=== Application Info ==="
+              curl -s http://localhost:8000/api/info | python3 -m json.tool || true
+              echo ""
+              echo "✅ App is running at: http://$(curl -s ifconfig.me):8000"
+            displayName: 'Show Deployment Status'

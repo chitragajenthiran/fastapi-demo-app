@@ -26,10 +26,9 @@ variables:
   dockerImageName: 'fastapi-demo-app'
   dockerTag: '$(Build.BuildId)'
   
-  # EC2 settings (set these as Pipeline Variables in Azure DevOps)
-  # EC2_HOST: Your EC2 public IP or DNS
-  # EC2_USER: ec2-user (Amazon Linux) or ubuntu (Ubuntu)
-  # SSH_SERVICE_CONNECTION: Name of your SSH service connection
+  # EC2 settings - Set these in Azure DevOps Pipeline Variables:
+  # EC2_HOST: Your EC2 public IP (e.g., 3.14.25.100)
+  # SSH_SERVICE_CONNECTION: Name of your SSH service connection (e.g., EC2-SSH-Connection)
 
 stages:
   # =============================================================================
