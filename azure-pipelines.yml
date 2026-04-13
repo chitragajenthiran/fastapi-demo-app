@@ -126,23 +126,71 @@ stages:
                 # Deploy to EC2 via SSH
                 # Option 1: Using SSH Service Connection
                 - task: SSH@0
-                  displayName: 'Deploy to EC2'
+                  displayName: 'Setup Docker on EC2 (if needed)'
+                  inputs:
+                    sshEndpoint: '$(SSH_SERVICE_CONNECTION)'
+                    runOptions: 'inline'
+                    inline: |
+                      echo "=== Checking if Docker is installed ==="
+                      if ! command -v docker &> /dev/null; then
+                        echo "Docker not found. Installing Docker..."
+                        
+                        # Detect OS and install Docker
+                        if [ -f /etc/os-release ]; then
+                          . /etc/os-release
+                          OS=$ID
+                        fi
+                        
+                        if [ "$OS" = "amzn" ] || [ "$OS" = "amazon" ]; then
+                          echo "Installing Docker on Amazon Linux..."
+                          sudo dnf update -y
+                          sudo dnf install docker -y
+                        elif [ "$OS" = "ubuntu" ]; then
+                          echo "Installing Docker on Ubuntu..."
+                          sudo apt update
+                          sudo apt install -y docker.io
+                        fi
+                        
+                        # Start and enable Docker
+                        sudo systemctl start docker
+                        sudo systemctl enable docker
+                        sudo usermod -aG docker $USER
+                        
+                        echo "Docker installed successfully!"
+                      else
+                        echo "Docker is already installed"
+                        docker --version
+                      fi
+                    readyTimeout: '60000'
+
+                # Copy Docker image to EC2
+                - task: CopyFilesOverSSH@0
+                  displayName: 'Copy Docker Image to EC2'
+                  inputs:
+                    sshEndpoint: '$(SSH_SERVICE_CONNECTION)'
+                    sourceFolder: '$(Pipeline.Workspace)/docker-image'
+                    contents: 'docker-image.tar'
+                    targetFolder: '/tmp'
+                    cleanTargetFolder: false
+
+                - task: SSH@0
+                  displayName: 'Deploy Container on EC2'
                   inputs:
                     sshEndpoint: '$(SSH_SERVICE_CONNECTION)'
                     runOptions: 'inline'
                     inline: |
                       echo "=== Stopping existing containers ==="
-                      docker stop fastapi-demo-app || true
-                      docker rm fastapi-demo-app || true
+                      sudo docker stop fastapi-demo-app || true
+                      sudo docker rm fastapi-demo-app || true
                       
                       echo "=== Cleaning up old images ==="
-                      docker image prune -f
+                      sudo docker image prune -f
                       
                       echo "=== Loading new Docker image ==="
-                      docker load -i /tmp/docker-image.tar
+                      sudo docker load -i /tmp/docker-image.tar
                       
                       echo "=== Starting new container ==="
-                      docker run -d \
+                      sudo docker run -d \
                         --name fastapi-demo-app \
                         --restart unless-stopped \
                         -p 8000:8000 \
@@ -154,17 +202,7 @@ stages:
                       curl -f http://localhost:8000/health || exit 1
                       
                       echo "=== Deployment successful! ==="
-                    readyTimeout: '20000'
-
-                # Copy Docker image to EC2 first
-                - task: CopyFilesOverSSH@0
-                  displayName: 'Copy Docker Image to EC2'
-                  inputs:
-                    sshEndpoint: '$(SSH_SERVICE_CONNECTION)'
-                    sourceFolder: '$(Pipeline.Workspace)/docker-image'
-                    contents: 'docker-image.tar'
-                    targetFolder: '/tmp'
-                    cleanTargetFolder: false
+                    readyTimeout: '30000'
 
   # =============================================================================
   # STAGE 3: VERIFY DEPLOYMENT
