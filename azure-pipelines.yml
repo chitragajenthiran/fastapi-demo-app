@@ -25,6 +25,7 @@ variables:
   # Docker settings
   dockerImageName: 'fastapi-demo-app'
   dockerTag: '$(Build.BuildId)'
+  group: EC2-Deployment-Vars
   
   # EC2 settings (set these as Pipeline Variables in Azure DevOps)
   # EC2_HOST: Your EC2 public IP or DNS
